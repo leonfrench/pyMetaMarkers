@@ -1,0 +1,36 @@
+[build-system]
+requires = ["setuptools>=64"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "pymetamarkers"
+version = "0.1.0"
+description = "Robust marker signatures from single-cell data (Python port of the MetaMarkers R package)"
+readme = "README.md"
+license = "MIT"
+requires-python = ">=3.10"
+dependencies = [
+    "numpy>=1.24",
+    "scipy>=1.10",
+    "pandas>=2.0",
+    "anndata>=0.10",
+    "h5py>=3.8",
+]
+
+[project.optional-dependencies]
+plot = ["matplotlib>=3.7"]
+umap = ["umap-learn>=0.5"]
+test = ["pytest>=7"]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+markers = [
+    "slow: tests that process full datasets several times",
+    "requires_r: tests that call Rscript with the MetaMarkers R package",
+]
+filterwarnings = [
+    "ignore:Variable names are not unique:UserWarning",
+]
