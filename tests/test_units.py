@@ -134,6 +134,37 @@ def test_ranking_methods_agree(toy):
         np.testing.assert_array_equal(a, b)
 
 
+def test_verbose_prints_stages(tmp_path, capsys, monkeypatch):
+    """verbose=True prints each stage (and progress) without changing the results."""
+    import anndata as ad
+
+    rng = np.random.default_rng(2)
+    counts = sp.random(2000, 300, density=0.1, format="csr", random_state=rng,
+                       data_rvs=lambda n: rng.poisson(3, n) + 1).astype(np.float32)
+    labels = rng.choice(["a", "b", "c"], 2000)
+    for layout in ("csr", "csc"):
+        ad.AnnData(counts.asformat(layout)).write_h5ad(tmp_path / f"{layout}.h5ad")
+    cpm = mm.convert_to_cpm(counts.astype(np.float64))
+    options = dict(max_nnz_per_block=5_000, n_jobs=2)
+    expected = mm.compute_markers(cpm, labels, **options)
+    assert capsys.readouterr().out == ""
+    monkeypatch.setattr(mm._progress, "PROGRESS_INTERVAL", 0)  # progress after every block
+    cases = [
+        (tmp_path / "csr.h5ad", "cpm", ["CSR matrix 'X'", "Counting stored values per gene", "Splitting the matrix"]),
+        (tmp_path / "csc.h5ad", "cpm", ["CSC matrix 'X'", "Computing library sizes (reading all genes)"]),
+        (cpm, None, ["CSR matrix in memory", "Converting the CSR matrix to CSC"]),
+    ]
+    for data, normalize, stages in cases:
+        markers = mm.compute_markers(data, labels, normalize=normalize, verbose=True, **options)
+        pd.testing.assert_frame_equal(markers, expected)
+        out = capsys.readouterr().out
+        lines = ["compute_markers: 2,000 cells x 300 genes", stages[0], "Group all: 2,000 cells, 3 cell types",
+                 *stages[1:], "Computing statistics for 300 genes", "of 300 genes (", "reading blocks",
+                 "Assembling the marker table", "Done: 900 rows"]
+        positions = [out.find(line) for line in lines]
+        assert -1 not in positions and positions == sorted(positions), out
+
+
 @pytest.mark.parametrize("options", [{}, {"tie_correction": True, "two_tailed": True}])
 def test_threads_match_serial(toy, options):
     X, labels = toy

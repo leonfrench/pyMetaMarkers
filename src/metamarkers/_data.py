@@ -20,6 +20,8 @@ import numpy as np
 import pandas as pd
 import scipy.sparse as sp
 
+from ._progress import QUIET
+
 DEFAULT_MAX_NNZ = 10_000_000
 
 
@@ -65,16 +67,21 @@ class MatrixSource:
     def n_vars(self) -> int:
         return self.shape[1]
 
-    def gene_nnz(self) -> np.ndarray:
+    def gene_nnz(self, log=QUIET) -> np.ndarray:
         raise NotImplementedError
+
+    def describe(self) -> str:
+        """Short description of the matrix and its storage (for verbose messages)."""
+        return type(self).__name__
 
     def row_chunks(self, max_nnz: int = DEFAULT_MAX_NNZ) -> Iterator[tuple[int, int, object]]:
         """Yield (start, stop, chunk) where chunk holds rows start:stop (CSR or dense)."""
         raise NotImplementedError
 
-    def column_blocks(self, max_nnz: int = DEFAULT_MAX_NNZ, tmp_dir=None) -> Iterator[tuple[int, int, sp.csc_matrix]]:
+    def column_blocks(self, max_nnz: int = DEFAULT_MAX_NNZ, tmp_dir=None,
+                      log=QUIET) -> Iterator[tuple[int, int, sp.csc_matrix]]:
         """Yield (start, stop, block) where block is a float64 CSC matrix of genes start:stop."""
-        edges = _plan_blocks(self.gene_nnz(), max_nnz)
+        edges = _plan_blocks(self.gene_nnz(log), max_nnz)
         if len(edges) == 1:
             start, stop = edges[0]
             chunks = [chunk for _, _, chunk in self.row_chunks(max_nnz)]
@@ -84,17 +91,20 @@ class MatrixSource:
                 full = np.vstack([c.toarray() if sp.issparse(c) else np.asarray(c) for c in chunks])
             yield start, stop, _canonical_csc(full)
             return
-        yield from _transpose_via_disk(self, edges, max_nnz, tmp_dir)
+        yield from _transpose_via_disk(self, edges, max_nnz, tmp_dir, log)
 
     #: library sizes computed as a by-product of a full pass (set by _transpose_via_disk)
     _cached_row_sums = None
 
-    def row_sums(self) -> np.ndarray:
+    def row_sums(self, log=QUIET) -> np.ndarray:
         if self._cached_row_sums is not None:
             return self._cached_row_sums
+        stage = log.stage("Computing library sizes (reading all cells)", self.n_obs, "cells")
         result = np.zeros(self.n_obs)
         for start, stop, chunk in self.row_chunks():
             result[start:stop] = _row_sums(chunk)
+            stage.update(stop)
+        stage.done()
         return result
 
     def close(self):
@@ -120,7 +130,13 @@ class InMemorySource(MatrixSource):
         self.X = X
         self.shape = X.shape
 
-    def gene_nnz(self) -> np.ndarray:
+    def describe(self) -> str:
+        X = self.X
+        if sp.issparse(X):
+            return f"{X.format.upper()} matrix in memory ({X.dtype}, {X.nnz:,} stored values)"
+        return f"dense matrix in memory ({X.dtype})"
+
+    def gene_nnz(self, log=QUIET) -> np.ndarray:
         X = self.X
         if sp.issparse(X):
             if X.format == "csc":
@@ -139,15 +155,16 @@ class InMemorySource(MatrixSource):
         for start, stop in _plan_blocks(nnz_rows, max_nnz):
             yield start, stop, X[start:stop]
 
-    def column_blocks(self, max_nnz: int = DEFAULT_MAX_NNZ, tmp_dir=None):
+    def column_blocks(self, max_nnz: int = DEFAULT_MAX_NNZ, tmp_dir=None, log=QUIET):
         X = self.X
         edges = _plan_blocks(self.gene_nnz(), max_nnz)
         if sp.issparse(X) and X.format == "csr" and len(edges) > 1:
+            log("Converting the CSR matrix to CSC (one copy)")
             X = X.tocsc()  # one copy, instead of scanning all rows for every block
         for start, stop in edges:
             yield start, stop, _canonical_csc(X[:, start:stop])
 
-    def row_sums(self) -> np.ndarray:
+    def row_sums(self, log=QUIET) -> np.ndarray:
         return _row_sums(self.X)
 
 
@@ -183,15 +200,26 @@ class H5Source(MatrixSource):
             self.dense = element
         self.column_major = self.format == "csc"
 
-    def gene_nnz(self) -> np.ndarray:
+    def describe(self) -> str:
+        dataset = self.dense if self.format == "dense" else self.data
+        layout = "dense" if self.format == "dense" else self.format.upper()
+        stored = "" if self.format == "dense" else f", {dataset.shape[0]:,} stored values"
+        chunks = "contiguous" if dataset.chunks is None else "chunks of " + " x ".join(f"{c:,}" for c in dataset.chunks)
+        return (f"{layout} matrix '{self.key}' in {self.path} ({dataset.dtype}{stored}; "
+                f"{dataset.compression or 'no'} compression, {chunks})")
+
+    def gene_nnz(self, log=QUIET) -> np.ndarray:
         if self.format == "csc":
             return np.diff(self.indptr)
+        stage = log.stage("Counting stored values per gene (reading all cells)", self.n_obs, "cells")
         result = np.zeros(self.n_vars, dtype=np.int64)
-        for _, _, chunk in self.row_chunks():
+        for _, stop, chunk in self.row_chunks():
             if sp.issparse(chunk):
                 result += np.bincount(chunk.indices, minlength=self.n_vars)
             else:
                 result += np.count_nonzero(chunk, axis=0)
+            stage.update(stop)
+        stage.done()
         return result
 
     def row_chunks(self, max_nnz: int = DEFAULT_MAX_NNZ):
@@ -214,9 +242,9 @@ class H5Source(MatrixSource):
             for start, stop in _plan_blocks(np.diff(full.indptr), max_nnz):
                 yield start, stop, full[start:stop]
 
-    def column_blocks(self, max_nnz: int = DEFAULT_MAX_NNZ, tmp_dir=None):
+    def column_blocks(self, max_nnz: int = DEFAULT_MAX_NNZ, tmp_dir=None, log=QUIET):
         if self.format != "csc":
-            yield from super().column_blocks(max_nnz, tmp_dir)
+            yield from super().column_blocks(max_nnz, tmp_dir, log)
             return
         for start, stop in _plan_blocks(self.gene_nnz(), max_nnz):
             lo, hi = self.indptr[start], self.indptr[stop]
@@ -226,13 +254,16 @@ class H5Source(MatrixSource):
             )
             yield start, stop, _canonical_csc(block)
 
-    def row_sums(self) -> np.ndarray:
+    def row_sums(self, log=QUIET) -> np.ndarray:
         if self.format == "csc":
+            stage = log.stage("Computing library sizes (reading all genes)", self.n_vars, "genes")
             result = np.zeros(self.n_obs)
-            for _, _, block in self.column_blocks():
+            for _, stop, block in self.column_blocks():
                 result += np.bincount(block.indices, weights=block.data, minlength=self.n_obs)
+                stage.update(stop)
+            stage.done()
             return result
-        return super().row_sums()
+        return super().row_sums(log)
 
     def close(self):
         try:
@@ -241,7 +272,8 @@ class H5Source(MatrixSource):
             pass
 
 
-def _transpose_via_disk(source: MatrixSource, edges, max_nnz, tmp_dir) -> Iterator[tuple[int, int, sp.csc_matrix]]:
+def _transpose_via_disk(source: MatrixSource, edges, max_nnz, tmp_dir,
+                        log=QUIET) -> Iterator[tuple[int, int, sp.csc_matrix]]:
     """Split a row-major source into gene blocks through temporary files.
 
     One pass converts each chunk of cells to CSC (so every gene block is a
@@ -250,6 +282,8 @@ def _transpose_via_disk(source: MatrixSource, edges, max_nnz, tmp_dir) -> Iterat
     matrix. Library sizes are computed on the way (see MatrixSource.row_sums).
     """
     directory = tempfile.mkdtemp(prefix="metamarkers_", dir=tmp_dir)
+    stage = log.stage(f"Splitting the matrix into {len(edges):,} blocks of genes (temporary files in {directory})",
+                      source.n_obs, "cells")
     row_type = np.int32 if source.n_obs < 2**31 else np.int64
     row_sums = np.zeros(source.n_obs)
     value_type = None
@@ -267,6 +301,8 @@ def _transpose_via_disk(source: MatrixSource, edges, max_nnz, tmp_dir) -> Iterat
                     np.diff(chunk.indptr[start:stop + 1]).astype(np.int64).tofile(handle)
                     rows[lo:hi].tofile(handle)
                     values[lo:hi].tofile(handle)
+            stage.update(row_stop)
+        stage.done()
         source._cached_row_sums = row_sums
         for path, (start, stop) in zip(paths, edges):
             yield start, stop, _read_block(path, stop - start, source.n_obs, row_type, value_type)

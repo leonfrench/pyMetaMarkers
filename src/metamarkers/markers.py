@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import itertools
 import os
+import time
 import warnings
 from collections import deque
 from concurrent.futures import ThreadPoolExecutor
@@ -15,6 +16,7 @@ import scipy.sparse as sp
 
 from . import _io
 from ._data import DEFAULT_MAX_NNZ, resolve_expression
+from ._progress import Log, format_duration
 from .aurocs import _sorted_levels, auroc_p_value, fdr
 from .normalization import _normalize_block
 
@@ -58,6 +60,7 @@ def compute_markers(
     max_nnz_per_block: int | None = None,
     n_jobs: int | None = None,
     tmp_dir=None,
+    verbose: bool = False,
 ) -> pd.DataFrame:
     """Compute differential expression statistics for all cell types, stratified by groups.
 
@@ -100,6 +103,10 @@ def compute_markers(
         uses all CPU cores. Peak memory grows with n_jobs x max_nnz_per_block.
     tmp_dir
         Directory for temporary files when transposing row-major h5ad matrices.
+    verbose
+        Print each stage (e.g. splitting a row-major file into blocks of genes,
+        computing statistics) with the elapsed time, and the progress of long
+        stages about once a minute.
 
     Returns
     -------
@@ -108,9 +115,12 @@ def compute_markers(
     """
     if normalize not in (None, "cpm"):
         raise ValueError("normalize must be None or 'cpm'.")
+    log = Log(verbose)
     expression = resolve_expression(data, layer=layer, genes_are_rows=genes_are_rows)
     try:
         genes = expression.gene_names(gene_names)
+        n_genes = len(genes)
+        log(f"compute_markers: {expression.shape[0]:,} cells x {n_genes:,} genes, {expression.source.describe()}")
         cell_types = expression.labels(cell_type_labels, "cell_type_labels")
         if group_labels is None:
             groups = np.full(len(cell_types), "all", dtype=object)
@@ -119,16 +129,17 @@ def compute_markers(
         plans = _plan_groups(cell_types, groups)
         if not plans:
             return pd.DataFrame({column: [] for column in MARKER_COLUMNS})
-        n_genes = len(genes)
+        for plan in plans:
+            log(f"Group {plan.name}: {plan.n_cells:,} cells, {len(plan.cell_types)} cell types")
         n_threads = (os.cpu_count() or 1) if n_jobs is None else max(int(n_jobs), 1)
         if max_nnz_per_block is None:
             max_nnz_per_block = int(np.clip(TOTAL_NNZ_IN_FLIGHT // n_threads, 2_500_000, DEFAULT_MAX_NNZ))
         for plan in plans:
             _allocate(plan, n_genes, tie_correction)
         # start reading blocks first: row-major files compute library sizes while being split
-        blocks = expression.source.column_blocks(max_nnz_per_block, tmp_dir)
+        blocks = expression.source.column_blocks(max_nnz_per_block, tmp_dir, log)
         first = next(blocks, None)
-        factors = expression.source.row_sums() / 1_000_000 if normalize == "cpm" else None
+        factors = expression.source.row_sums(log) / 1_000_000 if normalize == "cpm" else None
 
         def process(start, stop, block):
             if factors is not None:
@@ -139,32 +150,59 @@ def compute_markers(
                 _block_statistics(sub, plan, start, stop, tie_correction, vectorized_ranks=n_threads > 1)
 
         if first is not None:
-            _run_blocks(process, itertools.chain([first], blocks), n_threads)
+            threads = "1 thread" if n_threads == 1 else f"{n_threads} threads"
+            stage = log.stage(f"Computing statistics for {n_genes:,} genes ({threads}, "
+                              f"blocks of at most {max_nnz_per_block:,} stored values)", n_genes, "genes")
+            reading = _run_blocks(process, itertools.chain([first], blocks), n_threads, stage)
+            stage.done(f", {format_duration(reading)} of it reading blocks")
     finally:
         expression.close()
+    log("Assembling the marker table")
     tables = [_marker_table(plan, genes, two_tailed, tie_correction) for plan in plans]
     result = pd.concat(tables, ignore_index=True)
-    return _remove_duplicated_names(result, genes)
+    result = _remove_duplicated_names(result, genes)
+    log(f"Done: {len(result):,} rows")
+    return result
 
 
-def _run_blocks(process, blocks, n_jobs):
+def _run_blocks(process, blocks, n_jobs, stage):
     """Apply process(start, stop, block) to every block, with up to n_jobs blocks in flight.
 
     Blocks are read in the calling thread; the heavy numpy work (sorting,
-    bincounts) runs in worker threads.
+    bincounts) runs in worker threads. The number of genes done is reported to
+    stage. Returns the time spent reading blocks.
     """
+    read_times = []
+    blocks = _timed(blocks, read_times)
     if n_jobs == 1:
         for start, stop, block in blocks:
             process(start, stop, block)
-        return
+            stage.update(stop)
+        return sum(read_times)
     with ThreadPoolExecutor(max_workers=n_jobs) as pool:
         pending = deque()
         for start, stop, block in blocks:
-            pending.append(pool.submit(process, start, stop, block))
+            pending.append((stop, pool.submit(process, start, stop, block)))
             while len(pending) >= n_jobs:
-                pending.popleft().result()
-        for future in pending:
+                done, future = pending.popleft()
+                future.result()
+                stage.update(done)
+        for done, future in pending:
             future.result()
+            stage.update(done)
+    return sum(read_times)
+
+
+def _timed(iterable, times: list):
+    """Yield the items of iterable, appending the time taken to get each of them to times."""
+    iterator = iter(iterable)
+    while True:
+        start = time.perf_counter()
+        item = next(iterator, None)
+        times.append(time.perf_counter() - start)
+        if item is None:
+            return
+        yield item
 
 
 def _plan_groups(cell_types, groups) -> list[_Group]:

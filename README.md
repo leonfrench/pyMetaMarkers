@@ -61,6 +61,11 @@ The R vignettes are reproduced step by step in the test suite
   default system temp), so memory stays bounded; this costs one extra pass over
   the data. An **in-memory CSR** matrix is converted to CSC once (one copy) when
   it does not fit in a single block.
+* **`verbose=True`** (`compute_markers`) prints each stage with the elapsed
+  time, and the progress of long stages about once a minute. The first line
+  describes the storage (layout, compression, chunks); for CSR on disk, the two
+  passes over the file (counting values per gene, splitting it into gene
+  blocks) run on a single thread.
 * **`normalize="cpm"`** (`compute_markers`) and **`normalize="log1p_cpm"`**
   (`score_cells`) normalize on the fly, so files only need raw counts.
 * **Cells without a label** (`None`/`NaN`) are ignored, so subsets can be analysed
