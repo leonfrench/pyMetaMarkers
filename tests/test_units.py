@@ -96,6 +96,21 @@ def test_meta_markers_ranking():
     assert meta.query("gene == 'g1' and cell_type == 'x'")["fold_change"].item() == pytest.approx(10)
 
 
+@pytest.mark.filterwarnings("error::pandas.errors.DtypeWarning")
+def test_read_logical_columns_with_missing_values(tmp_path):
+    """A dataset's DE column is NA for cell types absent from it, possibly only in some of pandas' read chunks."""
+    n_genes = 50_000  # 150,000 rows: more than pandas parses in one chunk with low_memory=True
+    meta = pd.DataFrame({
+        "group": "all", "cell_type": np.repeat(["x", "y", "z"], n_genes),
+        "gene": np.tile([f"g{i}" for i in range(n_genes)], 3), "rank": np.tile(np.arange(1, n_genes + 1), 3),
+    })
+    meta["a"] = meta["rank"] % 3 == 0
+    meta["b"] = pd.array(meta["rank"] % 5 == 0, dtype="boolean")
+    meta.loc[meta["cell_type"] == "z", "b"] = pd.NA  # z is absent from dataset b
+    path = mm.export_meta_markers(meta, tmp_path / "meta.csv", ["a", "b"])
+    pd.testing.assert_frame_equal(mm.read_meta_markers(path), meta)
+
+
 def test_assign_cells_ties():
     scores = pd.DataFrame([[1.0, 0.0, 0.0], [0.0, 2.0, 2.0], [0.0, 0.0, 0.0], [0.5, 3.0, 1.0], [0.0, 0.0, 1.0]],
                           columns=["all|a", "all|b", "all|c"])

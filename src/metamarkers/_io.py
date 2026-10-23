@@ -72,6 +72,7 @@ def read_table(filename, header_size: int = 1) -> pd.DataFrame:
         filename, skiprows=header_size, keep_default_na=False, na_values=[""], float_precision="round_trip",
         true_values=["TRUE", "True", "true"], false_values=["FALSE", "False", "false"],
         dtype={"group": str, "cell_type": str, "gene": str},
+        low_memory=False,  # infer each column's type from all rows, not chunk by chunk
     )
     for column in result.columns:
         values = result[column]
